@@ -1,73 +1,56 @@
 #!/usr/bin/env python3
-"""Capture one image from every available camera and save to a folder."""
+"""Capture one image from every camera detected by Picamera2."""
 
 from __future__ import annotations
 
 import argparse
 import os
+import time
 from datetime import datetime
 from pathlib import Path
-from typing import List
+from typing import Dict, List
 
-import cv2
-
-
-def discover_camera_indices(max_index: int = 10) -> List[int]:
-    """Find working camera indices by probing VideoCapture."""
-    found: List[int] = []
-
-    # Prefer Linux video devices if present (Raspberry Pi typical case).
-    dev_dir = Path("/dev")
-    if dev_dir.exists():
-        for path in sorted(dev_dir.glob("video*")):
-            suffix = path.name.replace("video", "")
-            if suffix.isdigit():
-                idx = int(suffix)
-                if idx not in found:
-                    found.append(idx)
-
-    # Fallback probing.
-    for idx in range(max_index):
-        if idx not in found:
-            found.append(idx)
-
-    working: List[int] = []
-    for idx in found:
-        cap = cv2.VideoCapture(idx)
-        if not cap.isOpened():
-            cap.release()
-            continue
-
-        ok, _ = cap.read()
-        cap.release()
-        if ok:
-            working.append(idx)
-
-    return working
+from picamera2 import Picamera2
 
 
-def capture_from_camera(index: int, output_dir: Path) -> Path | None:
-    cap = cv2.VideoCapture(index)
-    if not cap.isOpened():
-        cap.release()
+def discover_cameras() -> List[Dict]:
+    """Return camera metadata provided by libcamera/Picamera2."""
+    return Picamera2.global_camera_info() or []
+
+
+def capture_from_camera(camera_num: int, output_dir: Path, warmup_seconds: float) -> Path | None:
+    picam2 = None
+    try:
+        picam2 = Picamera2(camera_num)
+        config = picam2.create_still_configuration()
+        picam2.configure(config)
+        picam2.start()
+
+        # Let auto-exposure/auto-white-balance settle.
+        if warmup_seconds > 0:
+            time.sleep(warmup_seconds)
+
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        output_path = output_dir / f"camera_{camera_num}_{ts}.jpg"
+        picam2.capture_file(str(output_path))
+        return output_path
+    except Exception:
         return None
-
-    ok, frame = cap.read()
-    cap.release()
-    if not ok or frame is None:
-        return None
-
-    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-    output_path = output_dir / f"camera_{index}_{ts}.jpg"
-    saved = cv2.imwrite(str(output_path), frame)
-    if not saved:
-        return None
-    return output_path
+    finally:
+        if picam2 is not None:
+            try:
+                picam2.stop()
+            except Exception:
+                pass
+            try:
+                picam2.close()
+            except Exception:
+                pass
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Save one image from each detected camera."
+        description="Save one image from each camera detected by Picamera2."
     )
     parser.add_argument(
         "-o",
@@ -76,31 +59,36 @@ def main() -> None:
         help="Folder to save images (default: camera_captures)",
     )
     parser.add_argument(
-        "--max-index",
-        type=int,
-        default=10,
-        help="Max camera index to probe in fallback mode (default: 10)",
+        "--warmup",
+        type=float,
+        default=0.7,
+        help="Seconds to wait after camera start before capture (default: 0.7)",
     )
     args = parser.parse_args()
 
     output_dir = Path(args.output)
     os.makedirs(output_dir, exist_ok=True)
 
-    indices = discover_camera_indices(max_index=args.max_index)
-    if not indices:
-        print("No working cameras found.")
+    cameras = discover_cameras()
+    if not cameras:
+        print("No cameras detected by Picamera2.")
         return
 
-    print(f"Detected working cameras: {indices}")
+    print(f"Detected cameras: {len(cameras)}")
 
     saved_any = False
-    for idx in indices:
-        saved_path = capture_from_camera(idx, output_dir)
+    for i, info in enumerate(cameras):
+        camera_num = int(info.get("Num", i))
+        model = info.get("Model", "Unknown")
+        location = info.get("Location", "Unknown")
+        print(f"- Camera {camera_num}: model={model}, location={location}")
+
+        saved_path = capture_from_camera(camera_num, output_dir, args.warmup)
         if saved_path:
             saved_any = True
-            print(f"Saved: {saved_path}")
+            print(f"  Saved: {saved_path}")
         else:
-            print(f"Failed to capture from camera index {idx}")
+            print(f"  Failed to capture from camera {camera_num}")
 
     if not saved_any:
         print("No images were saved.")
